@@ -1,8 +1,22 @@
 const fs = require('fs');
+const zod = require('zod');
 const fsPromises = require('fs').promises;
 const cheerio = require('cheerio');
+const { z } = require('zod');
 const ms = 5000; // 5 seconds
 const baseUrl = 'https://books.toscrape.com/catalogue/page-';
+
+const bookSchema = z.object({
+    title: z.string(),
+    product_url: z.string().url().startsWith('https://'),
+    price_text: z.string(),
+    price_gbp: z.number(),
+    availability_text: z.string(),
+    rating_text: z.string(),
+    description: z.string().nullable(),
+    source_page: z.string().url(),
+    fetched_at: z.string()
+});
 
 const allBookLinks = new Array(); // NUEVO: acumulador compartido entre todas las llamadas
 
@@ -129,6 +143,7 @@ async function extractRecord(bookUrl, sourcePage) {
         title: title,
         product_url: bookUrl,
         price_text: priceText,
+        price_gbp: cleanData(priceText),
         availability_text: availabilityText,
         rating_text: ratingText,
         description: description,
@@ -139,27 +154,58 @@ async function extractRecord(bookUrl, sourcePage) {
     return record; // CAMBIO 5: ahora sí regresa el objeto, no solo lo imprime
 }
 
+function cleanData(priceText) {
+    const numericString = priceText.replace(/[^0-9.]/g, '');
+    return parseFloat(numericString);
+}
+
 async function main() {
     // Recopilar los enlances de todas las N paginas
     await asyncCall(1);
-    
-    // Guardar la información de todos los libros
-    const allRecords = [];
-    for(const book of allBookLinks){
+
+    const validRecords = [];
+    const errorRecords = [];
+    const processedUrls = new Set();
+
+    for (const book of allBookLinks) {
+        if (processedUrls.has(book.url)) {
+            continue; 
+        }
+        processedUrls.add(book.url);
+
         const record = await extractRecord(book.url, book.sourcePage);
-        if(record){
-            allRecords.push(record);
+        
+        if (record) {
+            const validationResult = bookSchema.safeParse(record);
+            if (validationResult.success) {
+                // Si es válido, lo guardamos en la lista buena
+                validRecords.push(validationResult.data);
+            } else {
+                // Si falla, guardamos el registro y el motivo del error
+                errorRecords.push({
+                    url: book.url,
+                    record: record,
+                    reason: validationResult.error.errors
+                });
+            }
         }
     }
 
-    // Mostrar un registro
-    if (allRecords.length > 0) {
-        console.log("Muestra de un registro en bruto:");
-        console.log(allRecords[0]); 
+    await fsPromises.mkdir('./output', { recursive: true });
+    await fsPromises.writeFile('./output/books.json', JSON.stringify(validRecords, null, 2))
+    
+    if(errorRecords.length > 0){
+        await fsPromises.writeFile('./errors.json', JSON.stringify(errorRecords, null, 2));
+    }else{
+        if(fs.existsSync('./errors.json')){
+            await fsPromises.unlink('./errors.json');
+        }
     }
 
-    // Imprimir el resumen final
-    console.log(`detail_pages=${allRecords.length}`);
+    console.log(`Registros válidos procesados: ${validRecords.length}`);
+    if (validRecords.length > 0) {
+        console.log(`Ejemplo de precio limpio: ${validRecords[0].price_text} -> ${validRecords[0].price_gbp}`);
+    }
 }
 
 main();
