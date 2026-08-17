@@ -19,6 +19,9 @@ const bookSchema = z.object({
 });
 
 const allBookLinks = new Array(); // NUEVO: acumulador compartido entre todas las llamadas
+let cacheHitCount = 0;
+let fetchCount = 0;
+let cataloguePagesCount = 0;
 
 function sleep(delayMs) { // NUEVO: función de espera
     return new Promise(resolve => setTimeout(resolve, delayMs));
@@ -29,6 +32,7 @@ async function asyncCall(page) {
     let wasFetch = false; // NUEVO: para saber si hacemos sleep o no
     try {
         if (fs.existsSync(fileName)) {
+            cacheHitCount++;
             const data = await fsPromises.readFile(fileName, 'utf8');
             console.log(`CACHE HIT page ${page} (size: ${data.length} bytes)`);
         } else {
@@ -42,8 +46,9 @@ async function asyncCall(page) {
                 await fsPromises.mkdir('./cache', { recursive: true });
                 const html = await response.text();
                 await fsPromises.writeFile(fileName, html)
+                fetchCount++;
+                wasFetch = true;
                 console.log(`FETCH page ${page} (size: ${html.length} bytes)`);
-                wasFetch = true; // NUEVO
             } else {
                 console.error(`HTTP error! status: ${response.status} for page ${page}`);
                 return;
@@ -86,11 +91,12 @@ async function asyncCall(page) {
     if (nextHref && page < 3) { // CAMBIO: además de que exista "next", checa que no hayamos llegado al límite de 3
         await asyncCall(page + 1);
     } else {
+        cataloguePagesCount = page;
         console.log(`catalogue_pages=${page}, discovered=${allBookLinks.length}, unique_urls=${new Set(allBookLinks.map(link => link.url)).size}`);
     }
 }
 
-async function extractRecord(bookUrl, sourcePage) {
+async function extractRecord(bookUrl, sourcePage, attempt = 0) {
     // CAMBIO 1: usamos el penúltimo segmento de la URL (el slug único), no el último (siempre "index.html")
     const urlParts = bookUrl.split('/');
     const slug = urlParts[urlParts.length - 2];
@@ -122,8 +128,12 @@ async function extractRecord(bookUrl, sourcePage) {
             }
         }
     } catch (err) {
-        console.error(`Error fetching ${bookUrl}: ${err.message}`);
-        return null;
+        if (attempt == 0) {
+            return extractRecord(bookUrl, sourcePage, attempt + 1);
+        } else {
+            console.error(`Error fetching ${bookUrl}: ${err.message}`);
+            return null;
+        }
     }
 
     if (wasFetch) {
@@ -160,23 +170,26 @@ function cleanData(priceText) {
 }
 
 async function main() {
+    const startTime = new Date();
+
     // Recopilar los enlances de todas las N paginas
     await asyncCall(1);
+
+    allBookLinks.push({ url: 'https://books.toscrape.com/catalogue/no-existe-este-libro/index.html', sourcePage: 'test' }); //prueba
 
     const validRecords = [];
     const errorRecords = [];
     const processedUrls = new Set();
-
+    const failPages = new Set();
     for (const book of allBookLinks) {
         if (processedUrls.has(book.url)) {
-            continue; 
+            continue;
         }
         processedUrls.add(book.url);
 
         const record = await extractRecord(book.url, book.sourcePage);
-        
+        const validationResult = bookSchema.safeParse(record);
         if (record) {
-            const validationResult = bookSchema.safeParse(record);
             if (validationResult.success) {
                 // Si es válido, lo guardamos en la lista buena
                 validRecords.push(validationResult.data);
@@ -188,17 +201,22 @@ async function main() {
                     reason: validationResult.error.errors
                 });
             }
+        } else {
+            failPages.add({
+                url: book.url,
+                reason: 'fetch failed after retry'
+            });
         }
     }
 
     await fsPromises.mkdir('./output', { recursive: true });
     await fsPromises.writeFile('./output/books.json', JSON.stringify(validRecords, null, 2))
-    
-    if(errorRecords.length > 0){
-        await fsPromises.writeFile('./errors.json', JSON.stringify(errorRecords, null, 2));
-    }else{
-        if(fs.existsSync('./errors.json')){
-            await fsPromises.unlink('./errors.json');
+
+    if (errorRecords.length > 0) {
+        await fsPromises.writeFile('./output/errors.json', JSON.stringify(errorRecords, null, 2));
+    } else {
+        if (fs.existsSync('./output/errors.json')) {
+            await fsPromises.unlink('./output/errors.json');
         }
     }
 
@@ -206,6 +224,22 @@ async function main() {
     if (validRecords.length > 0) {
         console.log(`Ejemplo de precio limpio: ${validRecords[0].price_text} -> ${validRecords[0].price_gbp}`);
     }
+
+    const endTime = new Date(); // AGREGAR justo antes de armar el report
+    const durationSeconds = ((endTime - startTime) / 1000).toFixed(2);
+
+    const report = {
+        start_time: startTime.toISOString(),
+        duration: parseFloat(durationSeconds),
+        catalogue_pages: cataloguePagesCount,
+        cache_hits: cacheHitCount,
+        pages: fetchCount,
+        valid_records: validRecords.length,
+        invalid_records: errorRecords.length,
+        fail_pages: failPages.size
+    };
+
+    await fsPromises.writeFile('./output/run-report.json', JSON.stringify(report, null, 2));
 }
 
 main();
